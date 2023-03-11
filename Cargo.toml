@@ -1,0 +1,13 @@
+[package]
+name = "whoop"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+httparse = "1.8.0"
+may = "0.3.42"
+tracing = { version = "0.1", features = [
+    "max_level_off",
+], default-features = false }
