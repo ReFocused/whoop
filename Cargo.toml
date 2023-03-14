@@ -6,9 +6,27 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-circular-buffer = "0.1.1"
 heapless = "0.7.16"
-may = "0.3.42"
+tokio = { version = "1.26", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "parking_lot",
+] }
 tracing = { version = "0.1", features = [
     "max_level_off",
 ], default-features = false }
+trust-dns-resolver = "0.22.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
