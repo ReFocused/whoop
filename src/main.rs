@@ -1,5 +1,8 @@
+use http::Error;
 use std::{
+    future::Future,
     net::{IpAddr, Ipv4Addr},
+    pin::Pin,
     time::Duration,
 };
 use tokio::{
@@ -14,16 +17,32 @@ use trust_dns_resolver::{
 
 mod http;
 
-async fn handle_error<T, E: std::error::Error>(
-    stream: &mut TcpStream,
-    result: Result<T, E>,
-) -> Result<T, E> {
-    if let Err(ref e) = result {
-        let err = e.to_string();
-        let _ = stream.write_all(format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{err}", err.len()).as_bytes()).await;
-    }
+trait ResultExt<'a, T: Send + Sync + 'a> {
+    fn send_unwrap(
+        self,
+        stream: &'a mut TcpStream,
+    ) -> Pin<Box<dyn Future<Output = T> + 'a + Send + Sync>>;
+}
 
-    result
+impl<'a, T: Send + Sync + 'a> ResultExt<'a, T> for Result<T, Error> {
+    fn send_unwrap(
+        self,
+        stream: &'a mut TcpStream,
+    ) -> Pin<Box<dyn Future<Output = T> + 'a + Send + Sync>> {
+        Box::pin(async move {
+            match self {
+                Ok(t) => t,
+                Err(e) => {
+                    let err = e.as_str();
+                    let _ = stream.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{err}", err.len()).as_bytes()).await;
+                    #[cfg(not(debug_assertions))]
+                    std::panic::resume_unwind(Box::new(()));
+                    #[cfg(debug_assertions)]
+                    panic!("{e:#?}");
+                }
+            }
+        })
+    }
 }
 
 macro_rules! stream_loop {
@@ -43,19 +62,18 @@ macro_rules! stream_loop {
 async fn main() {
     let port = std::env::var("PORT").map_or(8000, |p| p.parse().unwrap());
 
-    let addr = Ipv4Addr::new(127, 0, 0, 1);
-    let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), port))
+    let listener = TcpListener::bind((Ipv4Addr::new(0, 0, 0, 0), port))
         .await
         .unwrap();
 
-    println!("Listening at http://{addr}:{port}");
+    println!("Listening at http://localhost:{port}");
 
     while let Ok((mut stream, _)) = listener.accept().await {
         tokio::spawn(async move {
             let mut parser = http::Parser::default();
 
             stream_loop!(Duration::from_secs(10), stream, buf, n => {
-                let removed = handle_error(&mut stream, parser.modify_stream(&mut buf)).await.unwrap();
+                let idx = parser.modify_stream(&mut buf[..n]).send_unwrap(&mut stream).await;
                 let ip = if let Ok(ip) = parser.addr.0.parse::<IpAddr>() {
                     ip
                 } else {
@@ -68,27 +86,17 @@ async fn main() {
                         .next()
                         .unwrap()
                 };
+                if ip.is_loopback() {
+                    stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nYou thought").await.unwrap();
+                    break;
+                }
                 let mut conn_stream = TcpStream::connect((ip, parser.addr.1)).await.unwrap();
-                std::fs::write("test.http", &buf[..n - removed]).unwrap();
-                conn_stream.write_all(&buf[..n - removed]).await.unwrap();
+                std::fs::write("test.http", &buf[..idx]).unwrap();
+                conn_stream.write_all(&buf[..idx]).await.unwrap();
                 stream_loop!(Duration::from_secs(5), conn_stream, buf, _ => {
                     stream.write_all(&buf).await.unwrap();
                 });
             });
         });
-    }
-}
-
-/// Removes an element from a slice.
-///
-/// Runs in O(n) time.
-fn remove_from_slice(slice: &mut [u8], index: usize) {
-    let len = slice.len();
-    if index < len {
-        unsafe {
-            let ptr = slice.as_mut_ptr().add(index);
-            std::ptr::copy(ptr.add(1), ptr, len - index - 1);
-            std::ptr::write_bytes(ptr.add(len - index - 1), 0, 1);
-        }
     }
 }

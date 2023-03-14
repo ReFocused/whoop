@@ -1,11 +1,7 @@
 //! A raw HTTP request parser.
 //! We do this manually because we don't need to parse the entire request body.
 
-use std::iter::Peekable;
-
 use heapless::String;
-
-use crate::remove_from_slice;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub enum Protocol {
@@ -38,24 +34,26 @@ pub enum Error {
     /// The port is invalid.
     InvalidPort,
 }
+impl Error {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Error::InvalidProtocol => {
+                "Invalid protocol (the path must start with http:// or https://)"
+            }
+            Error::TooLong => {
+                "The domain or path was too long (they have a max of 32 and 64 respectively)"
+            }
+            Error::MissingPath => {
+                "Missing the path after the domain (if you want the root path, use /)"
+            }
+            Error::InvalidMethod => "Invalid request method",
+            Error::InvalidPort => "Invalid port",
+        }
+    }
+}
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::InvalidProtocol => write!(
-                f,
-                "Invalid protocol (the path must start with http:// or https://)"
-            ),
-            Error::TooLong => write!(
-                f,
-                "The domain or path was too long (they have a max of 32 and 64 respectively)"
-            ),
-            Error::MissingPath => write!(
-                f,
-                "Missing the path after the domain (if you want the root path, use /)"
-            ),
-            Error::InvalidMethod => write!(f, "Invalid request method"),
-            Error::InvalidPort => write!(f, "Invalid port"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 impl std::error::Error for Error {}
@@ -75,16 +73,6 @@ pub enum RequestMethod {
     Other(String<8>),
 }
 
-fn skip_line(iter: &mut impl Iterator<Item = u8>) {
-    while let Some(byte) = iter.next() {
-        if byte == b'\r' {
-            if let Some(b'\n') = iter.next() {
-                break;
-            }
-        }
-    }
-}
-
 #[derive(Default, Debug, Clone)]
 pub struct Parser {
     past_header: bool,
@@ -100,162 +88,249 @@ pub struct Parser {
     pub method: RequestMethod,
 }
 
-fn copy_slice<const N: usize>(buf: &[u8; N]) -> [u8; N] {
-    let mut new_buf = [0u8; N];
-    unsafe {
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), new_buf.as_mut_ptr(), N);
-    }
-    new_buf
-}
-
 impl Parser {
-    pub fn modify_stream<const N: usize>(&mut self, buf: &mut [u8; N]) -> Result<usize, Error> {
-        let mut removed = 0;
+    pub fn modify_stream(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let mut idx = 0;
 
-        let iter = copy_slice(buf);
-        let mut iter = iter.iter().copied().enumerate().peekable();
-        if !self.past_header {
-            removed += self.parse_header(buf, &mut iter)?;
-            self.past_header = true;
+        macro_rules! next_mut {
+            () => {
+                if let Some(byte) = buf.get_mut(idx) {
+                    idx += 1;
+                    Some(byte)
+                } else {
+                    None
+                }
+            };
         }
-
-        Ok(removed)
-    }
-
-    fn parse_header<I: Iterator<Item = (usize, u8)>>(
-        &mut self,
-        buf: &mut [u8],
-        iter: &mut Peekable<I>,
-    ) -> Result<usize, Error> {
-        let mut removed = 0;
-
-        self.method = {
-            let mut method = String::new();
-            for (_, byte) in iter.by_ref() {
-                if byte == b' ' {
+        macro_rules! next {
+            () => {
+                if let Some(&byte) = buf.get(idx) {
+                    idx += 1;
+                    Some(byte)
+                } else {
+                    None
+                }
+            };
+        }
+        macro_rules! next_loop {
+            () => {{
+                let byte = next!();
+                if let Some(b) = byte {
+                    b
+                } else {
                     break;
                 }
-                method.push(byte as _).map_err(|_| Error::InvalidMethod)?;
-            }
-            match method.as_str() {
-                "GET" => RequestMethod::Get,
-                "POST" => RequestMethod::Post,
-                "PUT" => RequestMethod::Put,
-                "DELETE" => RequestMethod::Delete,
-                "HEAD" => RequestMethod::Head,
-                "OPTIONS" => RequestMethod::Options,
-                "CONNECT" => RequestMethod::Connect,
-                "TRACE" => RequestMethod::Trace,
-                "PATCH" => RequestMethod::Patch,
-                _ => RequestMethod::Other(method),
-            }
-        };
+            }};
+        }
+        macro_rules! next_mut_loop {
+            () => {{
+                let byte = next_mut!();
+                if let Some(b) = byte {
+                    b
+                } else {
+                    break;
+                }
+            }};
+        }
+        macro_rules! peek {
+            () => {
+                if let Some(&byte) = buf.get(idx) {
+                    Some(byte)
+                } else {
+                    None
+                }
+            };
+        }
+        macro_rules! peek_loop {
+            () => {
+                if let Some(byte) = peek!() {
+                    byte
+                } else {
+                    break;
+                }
+            };
+        }
 
-        assert_eq!(iter.next().map(|(_, b)| b as char), Some('/')); // skip the leading `/`
+        macro_rules! iter_loop {
+            ($var:ident, $body:block) => {
+                loop {
+                    let $var = next_loop!();
+                    $body
+                }
+            };
+        }
+        macro_rules! peek_iter_loop {
+            ($var:ident, $body:block) => {
+                loop {
+                    let $var = peek_loop!();
+                    $body
+                }
+            };
+        }
+        /// Removes the current byte from the buffer.
+        macro_rules! remove {
+            () => {
+                if let Some(byte) = peek!() {
+                    remove_from_slice(buf, idx);
+                    Some(byte)
+                } else {
+                    None
+                }
+            };
+        }
+        macro_rules! remove_loop {
+            () => {
+                if let Some(byte) = remove!() {
+                    byte
+                } else {
+                    break;
+                }
+            };
+        }
+        macro_rules! iter_remove_loop {
+            ($var:ident, $body:block) => {
+                loop {
+                    let $var = remove_loop!();
+                    $body
+                }
+            };
+        }
 
-        // get the protocol
-        let mut http = "http".bytes();
-
-        let mut protocol = None;
-        while let Some(&(i, byte)) = iter.peek() {
-            let next_byte = http.next();
-            match next_byte {
-                Some(b) => {
-                    iter.next();
-                    remove_from_slice(buf, i);
-                    if b != byte {
+        if !self.past_header {
+            self.method = {
+                let mut method = String::new();
+                iter_loop!(byte, {
+                    if byte == b' ' {
                         break;
                     }
-                    removed += 1;
+                    method.push(byte as _).map_err(|_| Error::InvalidMethod)?;
+                });
+                match method.as_str() {
+                    "GET" => RequestMethod::Get,
+                    "POST" => RequestMethod::Post,
+                    "PUT" => RequestMethod::Put,
+                    "DELETE" => RequestMethod::Delete,
+                    "HEAD" => RequestMethod::Head,
+                    "OPTIONS" => RequestMethod::Options,
+                    "CONNECT" => RequestMethod::Connect,
+                    "TRACE" => RequestMethod::Trace,
+                    "PATCH" => RequestMethod::Patch,
+                    _ => RequestMethod::Other(method),
                 }
-                None => {
-                    protocol.replace(if byte == b's' {
-                        iter.next();
-                        remove_from_slice(buf, i);
-                        removed += 1;
-                        Protocol::Https
-                    } else {
-                        Protocol::Http
+            };
+
+            assert_eq!(next!(), Some(b'/')); // skip the leading `/`
+
+            // get the protocol
+            let mut http = "http".bytes();
+
+            let mut protocol = None;
+            peek_iter_loop!(byte, {
+                let next_byte = http.next();
+                match next_byte {
+                    Some(b) => {
+                        remove!();
+                        if b != byte {
+                            break;
+                        }
+                    }
+                    None => {
+                        protocol.replace(if byte == b's' {
+                            remove!();
+
+                            Protocol::Https
+                        } else {
+                            Protocol::Http
+                        });
+                        break;
+                    }
+                }
+            });
+
+            self.protocol = protocol.ok_or(Error::InvalidProtocol)?;
+
+            // skip the ://
+            let Some(byte) = remove!() else {
+                return Err(Error::InvalidProtocol);
+            };
+            if byte != b':' {
+                return Err(Error::InvalidProtocol);
+            }
+            let Some(byte) = remove!() else {
+                return Err(Error::InvalidProtocol);
+            };
+            if byte != b'/' {
+                return Err(Error::InvalidProtocol);
+            }
+            let Some(byte) = remove!() else {
+                return Err(Error::InvalidProtocol);
+            };
+            if byte != b'/' {
+                return Err(Error::InvalidProtocol);
+            }
+
+            // get the domain and strip the domain from the buffer
+            let mut domain = String::new();
+            let mut port = String::<5>::new();
+
+            iter_remove_loop!(byte, {
+                if byte == b'/' {
+                    break;
+                } else if byte == b' ' {
+                    return Err(Error::MissingPath);
+                } else if byte == b':' {
+                    iter_remove_loop!(byte, {
+                        if byte == b'/' {
+                            break;
+                        } else if byte == b' ' {
+                            return Err(Error::MissingPath);
+                        }
+                        port.push(byte as _).map_err(|_| Error::InvalidPort)?;
                     });
                     break;
                 }
-            }
-        }
-
-        self.protocol = protocol.ok_or(Error::InvalidProtocol)?;
-
-        // skip the ://
-        let Some((i, byte)) = iter.next() else {
-                return Err(Error::InvalidProtocol);
+                domain.push(byte as _).map_err(|_| Error::TooLong)?;
+            });
+            let port = if port.is_empty() {
+                80
+            } else {
+                port.parse().map_err(|_| Error::InvalidPort)?
             };
-        if byte != b':' {
-            return Err(Error::InvalidProtocol);
-        }
-        remove_from_slice(buf, i);
-        removed += 1;
-        let Some((i, byte)) = iter.next() else {
-                return Err(Error::InvalidProtocol);
-            };
-        if byte != b'/' {
-            return Err(Error::InvalidProtocol);
-        }
-        remove_from_slice(buf, i);
-        removed += 1;
-        let Some((i, byte)) = iter.next() else {
-                return Err(Error::InvalidProtocol);
-            };
-        if byte != b'/' {
-            return Err(Error::InvalidProtocol);
-        }
-        remove_from_slice(buf, i);
-        removed += 1;
+            self.addr = (domain, port);
 
-        // get the domain and strip the domain from the buffer
-        let mut domain = String::new();
-        let mut port = String::<5>::new();
-
-        for (i, byte) in iter.by_ref() {
-            if byte == b'/' {
-                break;
-            } else if byte == b' ' {
-                return Err(Error::MissingPath);
-            } else if byte == b':' {
-                for (i, byte) in iter.by_ref() {
-                    if byte == b'/' {
-                        break;
-                    } else if byte == b' ' {
-                        return Err(Error::MissingPath);
-                    }
-                    port.push(byte as _).map_err(|_| Error::InvalidPort)?;
-                    remove_from_slice(buf, i);
-                    removed += 1;
+            // get the path
+            let mut path = String::new();
+            iter_loop!(byte, {
+                if byte == b' ' {
+                    break;
                 }
-                break;
-            }
-            // TODO: optimize this
-            remove_from_slice(buf, i);
-            removed += 1;
-            domain.push(byte as _).map_err(|_| Error::TooLong)?;
+                path.push(byte as _).map_err(|_| Error::TooLong)?;
+            });
+            self.path = path;
+
+            iter_loop!(byte, {
+                if byte == b'\n' {
+                    break;
+                }
+            });
+            self.past_header = true;
         }
-        let port = if port.is_empty() {
-            80
-        } else {
-            port.parse().map_err(|_| Error::InvalidPort)?
-        };
-        self.addr = (domain, port);
 
-        // get the path
-        let mut path = String::new();
-        for (_, byte) in iter.by_ref() {
-            if byte == b' ' {
-                break;
-            }
-            path.push(byte as _).map_err(|_| Error::TooLong)?;
+        println!("{:#?}", next!());
+
+        Ok(idx)
+    }
+}
+
+/// Removes an element from a slice.
+///
+/// Runs in O(n) time.
+fn remove_from_slice(slice: &mut [u8], index: usize) {
+    let len = slice.len();
+    if index < len {
+        unsafe {
+            let ptr = slice.as_mut_ptr().add(index);
+            std::ptr::copy(ptr.add(1), ptr, len - index - 1);
         }
-        self.path = path;
-
-        skip_line(&mut iter.map(|(_, b)| b));
-
-        Ok(removed)
     }
 }
