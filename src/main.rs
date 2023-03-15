@@ -72,8 +72,8 @@ async fn main() {
         tokio::spawn(async move {
             let mut parser = http::Parser::default();
 
-            stream_loop!(Duration::from_secs(10), stream, buf, n => {
-                let idx = parser.modify_stream(&mut buf[..n]).send_unwrap(&mut stream).await;
+            stream_loop!(Duration::from_secs(10), stream, buf, _ => {
+                let idx = parser.modify_stream(&mut buf).send_unwrap(&mut stream).await;
                 let ip = if let Ok(ip) = parser.addr.0.parse::<IpAddr>() {
                     ip
                 } else {

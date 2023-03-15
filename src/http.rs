@@ -1,6 +1,8 @@
 //! A raw HTTP request parser.
 //! We do this manually because we don't need to parse the entire request body.
 
+use std::cmp::Ordering;
+
 use heapless::String;
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -33,6 +35,8 @@ pub enum Error {
     InvalidMethod,
     /// The port is invalid.
     InvalidPort,
+    /// The request is invalid.
+    InvalidRequest,
 }
 impl Error {
     pub fn as_str(&self) -> &'static str {
@@ -48,6 +52,7 @@ impl Error {
             }
             Error::InvalidMethod => "Invalid request method",
             Error::InvalidPort => "Invalid port",
+            Error::InvalidRequest => "Invalid request",
         }
     }
 }
@@ -76,7 +81,7 @@ pub enum RequestMethod {
 #[derive(Default, Debug, Clone)]
 pub struct Parser {
     past_header: bool,
-    past_headers: bool,
+    finished: bool,
     /// The protocol of the request.
     pub protocol: Protocol,
     /// The domain of the request.
@@ -90,6 +95,10 @@ pub struct Parser {
 
 impl Parser {
     pub fn modify_stream(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if self.finished {
+            return Ok(memchr::memchr(b'\0', buf).unwrap_or(buf.len()));
+        }
+
         let mut idx = 0;
 
         macro_rules! next_mut {
@@ -152,7 +161,7 @@ impl Parser {
         }
 
         macro_rules! iter_loop {
-            ($var:ident, $body:block) => {
+            ($var:ident => $body:block) => {
                 loop {
                     let $var = next_loop!();
                     $body
@@ -160,7 +169,7 @@ impl Parser {
             };
         }
         macro_rules! peek_iter_loop {
-            ($var:ident, $body:block) => {
+            ($var:ident => $body:block) => {
                 loop {
                     let $var = peek_loop!();
                     $body
@@ -187,8 +196,8 @@ impl Parser {
                 }
             };
         }
-        macro_rules! iter_remove_loop {
-            ($var:ident, $body:block) => {
+        macro_rules! remove_iter_loop {
+            ($var:ident => $body:block) => {
                 loop {
                     let $var = remove_loop!();
                     $body
@@ -199,7 +208,7 @@ impl Parser {
         if !self.past_header {
             self.method = {
                 let mut method = String::new();
-                iter_loop!(byte, {
+                iter_loop!(byte => {
                     if byte == b' ' {
                         break;
                     }
@@ -225,7 +234,7 @@ impl Parser {
             let mut http = "http".bytes();
 
             let mut protocol = None;
-            peek_iter_loop!(byte, {
+            peek_iter_loop!(byte => {
                 let next_byte = http.next();
                 match next_byte {
                     Some(b) => {
@@ -273,13 +282,13 @@ impl Parser {
             let mut domain = String::new();
             let mut port = String::<5>::new();
 
-            iter_remove_loop!(byte, {
+            remove_iter_loop!(byte => {
                 if byte == b'/' {
                     break;
                 } else if byte == b' ' {
                     return Err(Error::MissingPath);
                 } else if byte == b':' {
-                    iter_remove_loop!(byte, {
+                    remove_iter_loop!(byte => {
                         if byte == b'/' {
                             break;
                         } else if byte == b' ' {
@@ -300,7 +309,7 @@ impl Parser {
 
             // get the path
             let mut path = String::new();
-            iter_loop!(byte, {
+            iter_loop!(byte => {
                 if byte == b' ' {
                     break;
                 }
@@ -308,7 +317,7 @@ impl Parser {
             });
             self.path = path;
 
-            iter_loop!(byte, {
+            iter_loop!(byte => {
                 if byte == b'\n' {
                     break;
                 }
@@ -316,21 +325,101 @@ impl Parser {
             self.past_header = true;
         }
 
-        println!("{:#?}", next!());
+        let host_str = b"Host: ";
+        let Some(host_idx) = memchr::memmem::find(buf, host_str) else {
+            return Ok(idx)
+        };
+
+        idx = host_idx + host_str.len();
+
+        let end = memchr::memchr(b'\n', &buf[idx..]).ok_or(Error::InvalidRequest)? - 2 /* \r\n */;
+
+        let port_digits = num_digits(self.addr.1) as usize;
+
+        let len_of_new_host = self.addr.0.len() + 1 + port_digits;
+
+        match Ord::cmp(&len_of_new_host, &(idx + end)) {
+            Ordering::Greater => {
+                let diff = len_of_new_host - (idx + end);
+                unsafe {
+                    // SAFETY: we remove the host from the buffer in the header, so we can shift the remaining bytes
+                    shift_right(buf, idx + end, diff);
+                }
+            }
+            Ordering::Less => {
+                let diff = (idx + end) - len_of_new_host;
+                println!("diff: {}", diff);
+                println!("end: {}", end);
+                println!("idx: {}", idx);
+                println!("len_of_new_host: {}", len_of_new_host);
+
+                remove_n_from_slice(buf, diff, idx + end);
+            }
+            Ordering::Equal => {}
+        }
+
+        let host_bytes = self.addr.0.as_bytes();
+
+        buf[idx..idx + host_bytes.len()].copy_from_slice(host_bytes);
+        idx += len_of_new_host - host_bytes.len();
+        buf[idx..idx + 1].copy_from_slice(b":");
+        idx += 1;
+
+        buf[idx..idx + port_digits].copy_from_slice(&num_to_bytes(self.addr.1)[..port_digits]);
+
+        idx = memchr::memchr(b'\0', buf).unwrap_or(buf.len());
+
+        self.finished = true;
 
         Ok(idx)
     }
 }
 
-/// Removes an element from a slice.
-///
-/// Runs in O(n) time.
-fn remove_from_slice(slice: &mut [u8], index: usize) {
+/// Removes a number of elements from a slice.
+fn remove_n_from_slice(slice: &mut [u8], index: usize, n: usize) {
     let len = slice.len();
     if index < len {
         unsafe {
             let ptr = slice.as_mut_ptr().add(index);
-            std::ptr::copy(ptr.add(1), ptr, len - index - 1);
+            std::ptr::copy(ptr.add(n), ptr, len - index - n);
         }
     }
+}
+
+/// Removes an element from a slice.
+fn remove_from_slice(slice: &mut [u8], index: usize) {
+    remove_n_from_slice(slice, index, 1);
+}
+
+/// Shifts all elements in a slice after the given index to the right n indices.
+///
+/// # Safety
+/// This function does not check if the slice is long enough to shift the elements.
+unsafe fn shift_right(slice: &mut [u8], index: usize, n: usize) {
+    let len = slice.len();
+    if index < len {
+        let ptr = slice.as_mut_ptr().add(index);
+        std::ptr::copy(ptr, ptr.add(n), len - index - n);
+    }
+}
+
+/// Gets the number of digits in a number.
+fn num_digits(mut n: u16) -> u8 {
+    let mut digits = 0;
+    while n > 0 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn num_to_bytes(mut n: u16) -> [u8; 5] {
+    let mut bytes = [0; 5];
+    let mut i = 0;
+    while n > 0 {
+        bytes[i] = (n % 10) as u8 + b'0';
+        n /= 10;
+        i += 1;
+    }
+    bytes
 }

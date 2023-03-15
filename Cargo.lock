@@ -692,6 +692,7 @@ name = "whoop"
 version = "0.1.0"
 dependencies = [
  "heapless",
+ "memchr",
  "tokio",
  "tracing",
  "trust-dns-resolver",
