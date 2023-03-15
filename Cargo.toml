@@ -2,6 +2,11 @@
 name = "whoop"
 version = "0.1.0"
 edition = "2021"
+description = "An extremely performant and simple CORS proxy"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/TheBotlyNoob/whoop"
+keywords = ["cors", "proxy", "http", "https"]
+categories = ["network-programming", "http", "https", "proxy", "cors"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,10 +20,14 @@ tokio = { version = "1.26", features = [
     "time",
     "parking_lot",
 ] }
+tokio-rustls = { version = "0.23.4", default-features = false, features = [
+    "tls12",
+] }
 tracing = { version = "0.1", features = [
     "max_level_off",
 ], default-features = false }
 trust-dns-resolver = "0.22.0"
+webpki-roots = "0.22.6"
 
 [profile.release]
 opt-level = 3
