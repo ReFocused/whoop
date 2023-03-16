@@ -22,6 +22,8 @@ use trust_dns_resolver::{
     TokioAsyncResolver,
 };
 
+use crate::http::modify_response;
+
 mod http;
 
 #[derive(Debug)]
@@ -78,7 +80,7 @@ impl<'a, T: Send + Sync + 'a, E: Into<Error> + Send + Sync + 'a> ResultExt<'a, T
                                 ).as_bytes(),
                             )
                             .await;
-                    silent_panic();
+                    std::panic::resume_unwind(Box::new(()));
                 }
             }
         })
@@ -99,10 +101,6 @@ macro_rules! stream_loop {
     };
 }
 
-fn silent_panic() -> ! {
-    std::panic::resume_unwind(Box::new(()));
-}
-
 #[tokio::main]
 async fn main() {
     let port = std::env::var("PORT").map_or(8000, |p| p.parse().unwrap());
@@ -112,8 +110,9 @@ async fn main() {
 
     println!("Listening at http://localhost:{port}");
 
-    let dns_resolver =
-        TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()).unwrap();
+    let dns_resolver = Arc::new(
+        TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()).unwrap(),
+    );
 
     let mut root_store = RootCertStore::empty();
     root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
@@ -141,52 +140,59 @@ async fn main() {
             stream_loop!(Duration::from_secs(10), stream, buf, _ => {
                 let idx = parser.modify_stream(&mut buf).send_unwrap(&mut stream).await;
 
-                let mut is_ip = false;
-                let ip = if let Ok(ip) = parser.addr.0.parse::<IpAddr>() {
-                    is_ip = true;
-                    ip
-                } else if let Ok(ips) = dns_resolver.lookup_ip(&*parser.addr.0).await {
-                    if let Some(ip) = ips.iter().find(|ip| !ip.is_loopback()) {
+                if let Some(ref info) = parser.info {
+                    let mut is_ip = false;
+                    let ip = if let Ok(ip) = info.addr.parse::<IpAddr>() {
+                        is_ip = true;
                         ip
+                    } else if let Ok(ips) = dns_resolver.lookup_ip(&*info.addr).await {
+                        if let Some(ip) = ips.iter().find(|ip| !ip.is_loopback()) {
+                            ip
+                        } else {
+                            Err::<(), _>(Error::NotFound).send_unwrap(&mut stream).await;
+                            unreachable!();
+                        }
                     } else {
                         Err::<(), _>(Error::NotFound).send_unwrap(&mut stream).await;
                         unreachable!();
+                    };
+                    if ip.is_loopback() {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nYou thought",
+                            )
+                            .await
+                            .unwrap();
+                        break;
                     }
-                } else {
-                    Err::<(), _>(Error::NotFound).send_unwrap(&mut stream).await;
-                    unreachable!();
-                };
-                if ip.is_loopback() {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nYou thought",
-                        )
-                        .await
-                        .unwrap();
-                    break;
-                }
-                let mut conn_stream = TcpStream::connect((ip, parser.addr.1.as_u16())).await.unwrap();
-                if parser.protocol == http::Protocol::Https {
-                    let mut stream = rustls_connector.connect(
-                        if is_ip {
-                            ServerName::IpAddress(ip)
-                        } else {
-                            ServerName::try_from(parser.addr.0.as_str()).map_err(|_| Error::NotFound).send_unwrap(&mut stream).await
-                        },
-                        &mut conn_stream
-                    ).await.unwrap();
 
-                    stream.write_all(&buf[..idx]).await.unwrap();
-                    stream_loop!(Duration::from_secs(5), stream, buf, _ => {
-                        stream.write_all(&buf).await.unwrap();
-                    });
-                } else {
-                    conn_stream.write_all(&buf[..idx]).await.unwrap();
-                    stream_loop!(Duration::from_secs(5), conn_stream, buf, _ => {
-                        stream.write_all(&buf).await.unwrap();
-                    });
-                }
+                    macro_rules! end {
+                        ($out_stream:ident, $in_stream:ident) => {{
+                            $out_stream.write_all(&buf[..idx]).await.unwrap();
+                            stream_loop!(Duration::from_secs(5), $in_stream, buf, n => {
+                                modify_response(&mut buf);
+                                println!("{}", String::from_utf8_lossy(&buf[..n]));
+                                $out_stream.write_all(&buf[..n]).await.unwrap();
+                            });
+                        }};
+                    }
 
+                    let mut conn_stream = TcpStream::connect((ip, info.port.get())).await.unwrap();
+                    if info.protocol == http::Protocol::Https {
+                        let mut conn_stream = rustls_connector.connect(
+                            if is_ip {
+                                ServerName::IpAddress(ip)
+                            } else {
+                                ServerName::try_from(&*info.addr).map_err(|_| Error::NotFound).send_unwrap(&mut stream).await
+                            },
+                            conn_stream
+                        ).await.unwrap();
+
+                        end!(conn_stream, stream);
+                    } else {
+                        end!(stream, conn_stream);
+                    }
+                }
             });
         });
     }

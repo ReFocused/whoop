@@ -1,7 +1,7 @@
 //! A raw HTTP request parser. We do this manually because we don't need to parse
 //! the entire request body.
 use heapless::String;
-use std::{cmp::Ordering, fmt::Display, num::NonZeroU16, str::FromStr};
+use std::{cmp::Ordering, num::NonZeroU16};
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -15,12 +15,10 @@ pub enum Error {
     /// The protocol is invalid because the path doesn't start with `http://` or
     /// `https://`.
     InvalidProtocol,
-    /// The domain or path is too long. The maximum length is 32 and 64 respectively.
+    /// The domain or path is too long. The maximum length for both is 64 bytes.
     TooLong,
     /// Missing the path in the path.
     MissingPath,
-    /// The method is invalid.
-    InvalidMethod,
     /// The port is invalid.
     InvalidPort,
     /// The request is invalid.
@@ -33,78 +31,45 @@ impl Error {
             Self::InvalidProtocol => {
                 "Invalid protocol (the path must start with http:// or https://)"
             }
-            Self::TooLong => {
-                "The domain or path was too long (they have a max of 32 and 64 respectively)"
-            }
+            Self::TooLong => "The domain or path was too long (they have a max of 64 each)",
             Self::MissingPath => {
                 "Missing the path after the domain (if you want the root path, use /)"
             }
-            Self::InvalidMethod => "Invalid request method",
             Self::InvalidPort => "Invalid port",
             Self::InvalidRequest => "Invalid request",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Port(pub NonZeroU16);
-impl Port {
-    pub const fn as_u16(self) -> u16 {
-        self.0.get()
-    }
+#[derive(Debug, Clone)]
+pub struct RequestInfo {
+    /// The protocol of the request.
+    pub protocol: Protocol,
+    /// The address of the request.
+    pub addr: String<64>,
+    /// The port of the request.
+    pub port: NonZeroU16,
 }
-impl Default for Port {
+impl Default for RequestInfo {
     fn default() -> Self {
-        Self(unsafe { NonZeroU16::new_unchecked(80) })
+        Self {
+            protocol: Protocol::default(),
+            addr: String::default(),
+            port: unsafe { NonZeroU16::new_unchecked(80) },
+        }
     }
-}
-impl FromStr for Port {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let port = s.parse().map_err(|_| Error::InvalidPort)?;
-        Ok(Self(port))
-    }
-}
-impl Display for Port {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_u16())
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-pub enum RequestMethod {
-    #[default]
-    Get,
-    Post,
-    Put,
-    Delete,
-    Head,
-    Options,
-    Connect,
-    Trace,
-    Patch,
-    Other(String<8>),
 }
 
 #[derive(Default, Debug, Clone)]
 pub struct Parser {
     past_header: bool,
-    finished: bool,
-    /// The protocol of the request.
-    pub protocol: Protocol,
-    /// The domain of the request.
-    pub addr: (String<32>, Port),
-    /// The path of the request, not including the leading `/`. This includes the query
-    /// string.
-    pub path: String<64>,
-    /// The method of the request.
-    pub method: RequestMethod,
+    pub info: Option<RequestInfo>,
 }
 
 impl Parser {
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub fn modify_stream(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        if self.finished {
+        if self.info.is_some() {
             return Ok(memchr::memchr(b'\0', buf).unwrap_or(buf.len()));
         }
         let mut idx = 0;
@@ -200,28 +165,15 @@ impl Parser {
             };
         }
 
+        let mut info = self.info.take().unwrap_or_default();
+
         if !self.past_header {
-            self.method = {
-                let mut method = String::new();
-                iter_loop!(byte => {
-                    if byte == b' ' {
-                        break;
-                    }
-                    method.push(byte as _).map_err(|_| Error::InvalidMethod)?;
-                });
-                match method.as_str() {
-                    "GET" => RequestMethod::Get,
-                    "POST" => RequestMethod::Post,
-                    "PUT" => RequestMethod::Put,
-                    "DELETE" => RequestMethod::Delete,
-                    "HEAD" => RequestMethod::Head,
-                    "OPTIONS" => RequestMethod::Options,
-                    "CONNECT" => RequestMethod::Connect,
-                    "TRACE" => RequestMethod::Trace,
-                    "PATCH" => RequestMethod::Patch,
-                    _ => RequestMethod::Other(method),
+            // skip the method
+            iter_loop!(byte => {
+                if byte == b' ' {
+                    break;
                 }
-            };
+            });
 
             // skip the leading `/`
             assert_eq!(next!(), Some(b'/'));
@@ -246,7 +198,7 @@ impl Parser {
                     break;
                 }
             });
-            self.protocol = protocol.ok_or(Error::InvalidProtocol)?;
+            info.protocol = protocol.ok_or(Error::InvalidProtocol)?;
 
             // skip the ://
             let Some(byte) = remove !() else {
@@ -269,7 +221,7 @@ impl Parser {
             }
 
             // get the domain and strip the domain from the buffer
-            let mut domain = String::new();
+            let mut addr = String::new();
             let mut port = String::<5>::new();
             remove_iter_loop!(byte => {
                 if byte == b'/' {
@@ -287,20 +239,20 @@ impl Parser {
                     });
                     break;
                 }
-                domain.push(byte as _).map_err(|_| Error::TooLong)?;
+                addr.push(byte as _).map_err(|_| Error::TooLong)?;
             });
-            let port = port.parse().unwrap_or_default();
-            self.addr = (domain, port);
+            info.addr = addr;
 
-            // get the path
-            let mut path = String::new();
-            iter_loop!(byte => {
-                if byte == b' ' {
-                    break;
-                }
-                path.push(byte as _).map_err(|_| Error::TooLong)?;
+            let port = port.parse().unwrap_or_else(|_| unsafe {
+                NonZeroU16::new_unchecked(if info.protocol == Protocol::Http {
+                    80
+                } else {
+                    443
+                })
             });
-            self.path = path;
+            info.port = port;
+
+            // skip the rest
             iter_loop!(byte => {
                 if byte == b'\n' {
                     break;
@@ -317,8 +269,8 @@ impl Parser {
 
         let len_of_old_host = memchr::memchr(b'\n', &buf[idx..]).ok_or(Error::InvalidRequest)? - 1;
 
-        let port_digits = num_digits(self.addr.1.as_u16()) as usize;
-        let len_of_new_host = self.addr.0.len() + 1 + port_digits;
+        let port_digits = num_digits(info.port.get()) as usize;
+        let len_of_new_host = info.addr.len() + 1 + port_digits;
 
         match Ord::cmp(&len_of_new_host, &len_of_old_host) {
             Ordering::Greater => {
@@ -338,19 +290,18 @@ impl Parser {
             Ordering::Equal => {}
         }
 
-        let host_bytes = self.addr.0.as_bytes();
+        let host_bytes = info.addr.as_bytes();
         buf[idx..idx + host_bytes.len()].copy_from_slice(host_bytes);
         idx += host_bytes.len();
 
         buf[idx..=idx].copy_from_slice(b":");
         idx += 1;
 
-        buf[idx..idx + port_digits]
-            .copy_from_slice(&num_to_bytes(self.addr.1.as_u16())[..port_digits]);
+        buf[idx..idx + port_digits].copy_from_slice(&num_to_bytes(info.port.get())[..port_digits]);
 
         idx = memchr::memchr(b'\0', buf).unwrap_or(buf.len());
 
-        self.finished = true;
+        self.info = Some(info);
 
         Ok(idx)
     }
@@ -416,4 +367,18 @@ const fn num_to_bytes(mut n: u16) -> [u8; 5] {
         j += 1;
     }
     bytes
+}
+
+/// Modifies an HTTP response by changing the CORS header to allow all origins.
+pub fn modify_response(response: &mut [u8]) {
+    let cors_header = b"Access-Control-Allow-Origin: ";
+    let Some(start) = memchr::memmem::find(response, cors_header) else {
+        return;
+    };
+    let Some(end) = memchr::memchr(b'\n', &response[start..]) else {
+        return;
+    };
+    response[start + cors_header.len()] = b'*';
+
+    remove_n_from_slice(response, start + cors_header.len() + 1, end - /* \r */ 1);
 }
