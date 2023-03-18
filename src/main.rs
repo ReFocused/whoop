@@ -160,7 +160,7 @@ async fn main() {
 
             stream_loop!(Duration::from_secs(10), stream, buf, n => {
                 let buf = {
-                    let removed = parser.modify_stream(&mut buf[..n]).send_unwrap(&mut stream).await;
+                    let removed = parser.modify_stream(&mut buf).send_unwrap(&mut stream).await;
                     let n = n - removed;
                     &buf[..n]
                 };

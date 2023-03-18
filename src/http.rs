@@ -269,7 +269,12 @@ impl Parser {
         let len_of_old_host = memchr::memchr(b'\n', &buf[idx..]).ok_or(Error::InvalidRequest)? - 1;
 
         let (port_bytes, port_digits) = num_to_bytes(info.port.get());
-        let len_of_new_host = info.addr.len() + 1 + port_digits;
+        let is_default_port = if info.protocol == Protocol::Http {
+            info.port.get() == 80
+        } else {
+            info.port.get() == 443
+        };
+        let len_of_new_host = info.addr.len() + if is_default_port { 0 } else { 1 + port_digits };
 
         match Ord::cmp(&len_of_new_host, &len_of_old_host) {
             Ordering::Greater => {
@@ -294,10 +299,12 @@ impl Parser {
         buf[idx..idx + host_bytes.len()].copy_from_slice(host_bytes);
         idx += host_bytes.len();
 
-        buf[idx..=idx].copy_from_slice(b":");
-        idx += 1;
+        if !is_default_port {
+            buf[idx..=idx].copy_from_slice(b":");
+            idx += 1;
 
-        buf[idx..idx + port_digits].copy_from_slice(&port_bytes[..port_digits]);
+            buf[idx..idx + port_digits].copy_from_slice(&port_bytes[..port_digits]);
+        }
 
         self.info = Some(info);
 
@@ -366,11 +373,12 @@ const fn num_to_bytes(mut n: u16) -> ([u8; 5], usize) {
     }
 
     // reverse the array
-    while i > 0 {
-        i -= 1;
-        let tmp = bytes[i];
-        bytes[i] = bytes[digits - i - 1];
-        bytes[digits - i - 1] = tmp;
+    let mut j = 0;
+    while j < i / 2 {
+        let tmp = bytes[j];
+        bytes[j] = bytes[i - j - 1];
+        bytes[i - j - 1] = tmp;
+        j += 1;
     }
 
     (bytes, digits)
