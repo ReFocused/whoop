@@ -69,10 +69,8 @@ pub struct Parser {
 impl Parser {
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub fn modify_stream(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        if self.info.is_some() {
-            return Ok(memchr::memchr(b'\0', buf).unwrap_or(buf.len()));
-        }
         let mut idx = 0;
+        let mut removed = 0;
 
         macro_rules! next {
             () => {
@@ -139,6 +137,7 @@ impl Parser {
             () => {
                 if let Some(byte) = peek!() {
                     remove_from_slice(buf, idx);
+                    removed += 1;
                     Some(byte)
                 } else {
                     None
@@ -263,13 +262,13 @@ impl Parser {
 
         let host_str = b"Host: ";
         let Some(host_idx) = memchr::memmem::find(buf, host_str) else {
-            return Ok(idx)
+            return Ok(removed)
         };
         idx = host_idx + host_str.len();
 
         let len_of_old_host = memchr::memchr(b'\n', &buf[idx..]).ok_or(Error::InvalidRequest)? - 1;
 
-        let port_digits = num_digits(info.port.get()) as usize;
+        let (port_bytes, port_digits) = num_to_bytes(info.port.get());
         let len_of_new_host = info.addr.len() + 1 + port_digits;
 
         match Ord::cmp(&len_of_new_host, &len_of_old_host) {
@@ -279,6 +278,7 @@ impl Parser {
                     idx + len_of_old_host,
                     len_of_new_host - len_of_old_host,
                 );
+                removed -= len_of_new_host - len_of_old_host;
             }
             Ordering::Less => {
                 remove_n_from_slice(
@@ -297,20 +297,33 @@ impl Parser {
         buf[idx..=idx].copy_from_slice(b":");
         idx += 1;
 
-        buf[idx..idx + port_digits].copy_from_slice(&num_to_bytes(info.port.get())[..port_digits]);
-
-        idx = memchr::memchr(b'\0', buf).unwrap_or(buf.len());
+        buf[idx..idx + port_digits].copy_from_slice(&port_bytes[..port_digits]);
 
         self.info = Some(info);
 
-        Ok(idx)
+        Ok(removed)
     }
+}
+
+/// Modifies an HTTP response by changing the CORS header to allow all origins.
+pub fn modify_response(response: &mut [u8]) {
+    let cors_header = b"Access-Control-Allow-Origin: ";
+    let Some(start) = memchr::memmem::find(response, cors_header) else {
+        return;
+    };
+    let start = start + cors_header.len();
+    let Some(end) = memchr::memchr(b'\n', &response[start..]) else {
+        return;
+    };
+    response[start] = b'*';
+
+    remove_n_from_slice(response, start + 1, end - /* \r */ 1);
 }
 
 /// Removes a number of elements from a slice.
 fn remove_n_from_slice(slice: &mut [u8], index: usize, n: usize) {
     let len = slice.len();
-    if index < len {
+    if index + n < len {
         unsafe {
             let ptr = slice.as_mut_ptr().add(index);
             std::ptr::copy(ptr.add(n), ptr, len - index - n);
@@ -340,45 +353,25 @@ fn shift_right(slice: &mut [u8], index: usize, n: usize) {
     }
 }
 
-/// Gets the number of digits in a number.
-const fn num_digits(mut n: u16) -> u8 {
-    let mut digits = 0;
-    while n > 0 {
-        n /= 10;
-        digits += 1;
-    }
-    digits
-}
-
-const fn num_to_bytes(mut n: u16) -> [u8; 5] {
+const fn num_to_bytes(mut n: u16) -> ([u8; 5], usize) {
     let mut bytes = [0; 5];
     let mut i = 0;
+    let mut digits = 0;
+
     while n > 0 {
         bytes[i] = (n % 10) as u8 + b'0';
         n /= 10;
         i += 1;
+        digits += 1;
     }
-    // reverse the bytes
-    let mut j = 0;
-    while j < i / 2 {
-        let tmp = bytes[j];
-        bytes[j] = bytes[i - j - 1];
-        bytes[i - j - 1] = tmp;
-        j += 1;
+
+    // reverse the array
+    while i > 0 {
+        i -= 1;
+        let tmp = bytes[i];
+        bytes[i] = bytes[digits - i - 1];
+        bytes[digits - i - 1] = tmp;
     }
-    bytes
-}
 
-/// Modifies an HTTP response by changing the CORS header to allow all origins.
-pub fn modify_response(response: &mut [u8]) {
-    let cors_header = b"Access-Control-Allow-Origin: ";
-    let Some(start) = memchr::memmem::find(response, cors_header) else {
-        return;
-    };
-    let Some(end) = memchr::memchr(b'\n', &response[start..]) else {
-        return;
-    };
-    response[start + cors_header.len()] = b'*';
-
-    remove_n_from_slice(response, start + cors_header.len() + 1, end - /* \r */ 1);
+    (bytes, digits)
 }
