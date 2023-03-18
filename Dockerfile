@@ -1,15 +1,15 @@
-FROM rust:1.68-slim as build
+FROM rust:1.68-alpine3.17 as build
 
-RUN apt-get update && apt-get install -y musl-tools build-essential
-RUN rustup target add x86_64-unknown-linux-musl
+RUN apk add --no-cache musl-dev
 
 ADD . /src
 WORKDIR /src
 
-RUN cargo build --locked --release --target x86_64-unknown-linux-musl
+RUN cargo build --locked --release
 
-FROM alpine:3.17 as runtime
+FROM scratch
 
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/whoop /whoop
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /src/target/release/whoop /whoop
 
 ENTRYPOINT [ "/whoop" ]
