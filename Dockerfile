@@ -9,6 +9,8 @@ RUN cargo build --locked --release
 
 FROM scratch
 
+EXPOSE ${PORT:-8000}
+
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /src/target/release/whoop /whoop
 
