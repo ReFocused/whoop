@@ -268,11 +268,12 @@ impl Parser {
 
         let len_of_old_host = memchr::memchr(b'\n', &buf[idx..]).ok_or(Error::InvalidRequest)? - 1;
 
-        let (port_bytes, port_digits) = num_to_bytes(info.port.get());
+        let port = info.port.get();
+        let (port_bytes, port_digits) = num_to_bytes(port);
         let is_default_port = if info.protocol == Protocol::Http {
-            info.port.get() == 80
+            port == 80
         } else {
-            info.port.get() == 443
+            port == 443
         };
         let len_of_new_host = info.addr.len() + if is_default_port { 0 } else { 1 + port_digits };
 
