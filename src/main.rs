@@ -135,6 +135,8 @@ async fn handle_stream(
             &buf[..n]
         };
 
+        println!("GOT: {}", String::from_utf8_lossy(buf));
+
         if let Some(ref info) = parser.info {
             let ip = if info.addr.parse::<IpAddr>().is_ok() {
                 return Err(Error::IpNotSupported);
@@ -171,18 +173,16 @@ async fn handle_stream(
             let mut conn_stream = TcpStream::connect((ip, info.port.get())).await?;
 
             if info.protocol == http::Protocol::Https {
+                println!("HTTPS");
+
                 let mut conn_stream = rustls_connector.connect(
                     ServerName::try_from(&*info.addr).map_err(|_| Error::NotFound)?,
                     conn_stream
                 ).await?;
 
-                println!("GOT: {}", String::from_utf8_lossy(buf));
-
-                conn_stream.write_all(buf).await?;
-                conn_stream.flush().await?;
-
                 end!(conn_stream => stream);
             } else {
+                println!("HTTP");
                 end!(conn_stream => stream);
             }
 
