@@ -160,6 +160,7 @@ async fn handle_stream(
                     stream_loop!(Duration::from_secs(10), $in_stream, buf, n => {
                         let buf = &mut buf[..n];
                         modify_response(buf);
+                        println!("SENT: {}", String::from_utf8_lossy(buf));
                         $out_stream.write_all(buf).await?;
                     });
 
@@ -174,6 +175,8 @@ async fn handle_stream(
                     ServerName::try_from(&*info.addr).map_err(|_| Error::NotFound)?,
                     conn_stream
                 ).await?;
+
+                println!("GOT: {}", String::from_utf8_lossy(buf));
 
                 conn_stream.write_all(buf).await?;
                 conn_stream.flush().await?;
