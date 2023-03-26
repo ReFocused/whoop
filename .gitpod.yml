@@ -6,6 +6,6 @@
 
 tasks:
   - init: rustup toolchain add nightly && cargo +nightly build
-    command: cargo watch -x "+nightly run"
+    command: rustup toolchain add nightly && cargo watch -x "+nightly run"
 
 

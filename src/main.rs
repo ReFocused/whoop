@@ -25,7 +25,7 @@ use crate::http::modify_response;
 
 mod http;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Error {
     Http(http::Error),
     NotFound,
@@ -58,7 +58,7 @@ impl<T: std::error::Error> From<T> for Error {
 async fn send_error(
     e: impl Into<Error> + std::fmt::Debug + Send + Sync,
     stream: &mut TcpStream,
-) -> ! {
+) {
     let err = e.into().as_str();
     let _unneeded =
         stream
@@ -69,7 +69,6 @@ async fn send_error(
                 ).as_bytes(),
             )
             .await;
-    panic!("{err}");
 }
 
 macro_rules! stream_loop {
@@ -119,7 +118,9 @@ async fn main() {
         let rustls_connector = rustls_connector.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_stream(dns_resolver, rustls_connector, &mut stream).await {
+                eprintln!("{e:#?}");
                 send_error(e, &mut stream).await;
+                return;
             }
         });
     }
@@ -174,7 +175,6 @@ async fn handle_stream(
                 }
             };
 
-
             conn.write_all(buf).await?;
             conn.flush().await?;
 
@@ -185,6 +185,7 @@ async fn handle_stream(
                     stream.write_all(buf).await?;
                     stream.flush().await?;
                 });
+                break;
             }
 
             connection.replace(conn);
