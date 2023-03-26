@@ -1,7 +1,20 @@
 //! A raw HTTP request parser. We do this manually because we don't need to parse
 //! the entire request body.
 use heapless::String;
+use memchr::memmem::find;
 use std::{cmp::Ordering, num::NonZeroU16};
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentLength {
+    content_length: usize,
+    bytes_given: usize,
+}
+
+impl ContentLength {
+    pub const fn full(self) -> bool {
+        self.content_length >= self.bytes_given
+    }
+}
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -62,13 +75,21 @@ impl Default for RequestInfo {
 
 #[derive(Default, Debug, Clone)]
 pub struct Parser {
-    past_header: bool,
+    past_heading: bool,
+    past_host: bool,
+    /// (bytes past heading, content length)
+    content_len: Option<ContentLength>,
+    pub finished: bool,
     pub info: Option<RequestInfo>,
 }
 
 impl Parser {
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub fn modify_stream(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if self.finished {
+            return Ok(0);
+        }
+
         let mut idx = 0;
         let mut removed = 0;
 
@@ -166,7 +187,7 @@ impl Parser {
 
         let mut info = self.info.take().unwrap_or_default();
 
-        if !self.past_header {
+        if !self.past_heading {
             // skip the method
             iter_loop!(byte => {
                 if byte == b' ' {
@@ -175,7 +196,13 @@ impl Parser {
             });
 
             // skip the leading `/`
-            assert_eq!(next!(), Some(b'/'));
+            if next!() != Some(b'/') {
+                return Err(Error::InvalidRequest);
+            }
+            if peek!() == Some(b'?') {
+                // give an alternate access point for weird browsers
+                remove!();
+            }
 
             // get the protocol
             let mut http = "http".bytes();
@@ -200,19 +227,19 @@ impl Parser {
             info.protocol = protocol.ok_or(Error::InvalidProtocol)?;
 
             // skip the ://
-            let Some(byte) = remove !() else {
+            let Some(byte) = remove!() else {
                 return Err(Error::InvalidProtocol);
             };
             if byte != b':' {
                 return Err(Error::InvalidProtocol);
             }
-            let Some(byte) = remove !() else {
+            let Some(byte) = remove!() else {
                 return Err(Error::InvalidProtocol);
             };
             if byte != b'/' {
                 return Err(Error::InvalidProtocol);
             }
-            let Some(byte) = remove !() else {
+            let Some(byte) = remove!() else {
                 return Err(Error::InvalidProtocol);
             };
             if byte != b'/' {
@@ -257,16 +284,41 @@ impl Parser {
                     break;
                 }
             });
-            self.past_header = true;
+            self.past_heading = true;
         }
 
-        let host_str = b"Host: ";
-        let Some(host_idx) = memchr::memmem::find(buf, host_str) else {
-            return Ok(removed)
-        };
-        idx = host_idx + host_str.len();
+        if !self.past_host {
+            let r = Self::replace_host_header(&mut buf[idx..], &info)?;
+            if r != 0 {
+                self.past_host = true;
+            }
+            removed += r;
+        }
+        let heading_end = find(&buf[idx..], b"\r\n\r\n").map_or(0, |i| i + 4);
 
-        let len_of_old_host = memchr::memchr(b'\n', &buf[idx..]).ok_or(Error::InvalidRequest)? - 1;
+        self.get_content_len(&mut buf[idx..], heading_end)?;
+
+        if (heading_end == 0 && self.content_len.map_or(false, ContentLength::full))
+            || (heading_end != 0 && self.content_len.is_none())
+        {
+            self.finished = true;
+        }
+
+        self.info = Some(info);
+
+        Ok(removed)
+    }
+
+    fn replace_host_header(buf: &mut [u8], info: &RequestInfo) -> Result<usize, Error> {
+        let mut removed = 0;
+
+        let host_str = b"Host: ";
+        let Some(host_idx) = find(buf, host_str) else {
+            return Ok(0);
+        };
+        let mut idx = host_idx + host_str.len();
+
+        let len_of_old_host = memchr::memchr(b'\r', &buf[idx..]).ok_or(Error::InvalidRequest)?;
 
         let port = info.port.get();
         let (port_bytes, port_digits) = num_to_bytes(port);
@@ -307,9 +359,30 @@ impl Parser {
             buf[idx..idx + port_digits].copy_from_slice(&port_bytes[..port_digits]);
         }
 
-        self.info = Some(info);
-
         Ok(removed)
+    }
+
+    fn get_content_len(&mut self, buf: &mut [u8], heading_end: usize) -> Result<(), Error> {
+        let content_len_str = b"\nContent-Length: ";
+        let Some(host_idx) = find(buf, content_len_str) else {
+            return Ok(());
+        };
+        let idx = host_idx + content_len_str.len();
+
+        let mut content_len = self.content_len.unwrap_or_default();
+        let end = memchr::memchr(b'\r', &buf[idx..]).ok_or(Error::InvalidRequest)?;
+        let total_content_len = std::str::from_utf8(&buf[idx..idx + end])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(Error::InvalidRequest)?;
+
+        content_len.content_length = total_content_len;
+
+        content_len.bytes_given += buf.len() - heading_end;
+
+        self.content_len.replace(content_len);
+
+        Ok(())
     }
 }
 
@@ -375,6 +448,7 @@ const fn num_to_bytes(mut n: u16) -> ([u8; 5], usize) {
 
     // reverse the array
     let mut j = 0;
+    #[allow(clippy::manual_swap)]
     while j < i / 2 {
         let tmp = bytes[j];
         bytes[j] = bytes[i - j - 1];

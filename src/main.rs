@@ -3,15 +3,16 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr},
+    pin::Pin,
     sync::Arc,
-    time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
 use tokio_rustls::{
+    client::TlsStream,
     rustls::{OwnedTrustAnchor, RootCertStore, ServerName},
     TlsConnector,
 };
@@ -54,9 +55,12 @@ impl<T: std::error::Error> From<T> for Error {
     }
 }
 
-async fn send_error(e: impl Into<Error> + Send + Sync, stream: &mut TcpStream) -> ! {
+async fn send_error(
+    e: impl Into<Error> + std::fmt::Debug + Send + Sync,
+    stream: &mut TcpStream,
+) -> ! {
     let err = e.into().as_str();
-    let _ =
+    let _unneeded =
         stream
             .write_all(
                 format!(
@@ -69,10 +73,10 @@ async fn send_error(e: impl Into<Error> + Send + Sync, stream: &mut TcpStream) -
 }
 
 macro_rules! stream_loop {
-    ($timeout: expr, $stream: expr, $buf: ident, $n: pat => $body: block) => {
+    ($stream: expr, $buf: ident, $n: pat => $body: block) => {
         loop {
             let mut $buf = [0u8; 1024];
-            match timeout($timeout, $stream.read(&mut $buf)).await {
+            match timeout(std::time::Duration::from_secs(10), $stream.read(&mut $buf)).await {
                 // timeout or EOF
                 Err(_) | Ok(Ok(0)) => break,
                 Ok(Ok($n)) => $body,
@@ -128,14 +132,14 @@ async fn handle_stream(
 ) -> Result<(), Error> {
     let mut parser = http::Parser::default();
 
-    stream_loop!(Duration::from_secs(10), stream, buf, n => {
+    let mut connection = None;
+
+    stream_loop!(stream, buf, n => {
         let buf = {
             let removed = parser.modify_stream(&mut buf)?;
             let n = n - removed;
             &buf[..n]
         };
-
-        println!("GOT: {}", String::from_utf8_lossy(buf));
 
         if let Some(ref info) = parser.info {
             let ip = if info.addr.parse::<IpAddr>().is_ok() {
@@ -154,41 +158,151 @@ async fn handle_stream(
                 return Err(Error::LoopbackIp);
             }
 
-            macro_rules! end {
-                ($in_stream: ident => $out_stream: ident) => {
-                    $in_stream.write_all(buf).await?;
-                    $in_stream.flush().await?;
-
-                    stream_loop!(Duration::from_secs(10), $in_stream, buf, n => {
-                        let buf = &mut buf[..n];
-                        modify_response(buf);
-                        println!("SENT: {}", String::from_utf8_lossy(buf));
-                        $out_stream.write_all(buf).await?;
-                    });
-
-                    $out_stream.flush().await?;
-                }
-            }
-
-            let mut conn_stream = TcpStream::connect((ip, info.port.get())).await?;
-
-            if info.protocol == http::Protocol::Https {
-                println!("HTTPS");
-
-                let mut conn_stream = rustls_connector.connect(
-                    ServerName::try_from(&*info.addr).map_err(|_| Error::NotFound)?,
-                    conn_stream
-                ).await?;
-
-                end!(conn_stream => stream);
+            let mut conn = if let Some(c) = connection.take() {
+                c
             } else {
-                println!("HTTP");
-                end!(conn_stream => stream);
+                let c = TcpStream::connect((ip, info.port.get())).await?;
+                if info.protocol == http::Protocol::Https {
+                    let c = rustls_connector.connect(
+                        ServerName::try_from(&*info.addr).map_err(|_| Error::NotFound)?,
+                        c
+                    ).await?;
+
+                    Connection::Https(c)
+                } else {
+                    Connection::Http(c)
+                }
+            };
+
+
+            conn.write_all(buf).await?;
+            conn.flush().await?;
+
+            if parser.finished {
+                stream_loop!(conn, buf, n => {
+                    let buf = &mut buf[..n];
+                    modify_response(buf);
+                    stream.write_all(buf).await?;
+                    stream.flush().await?;
+                });
             }
 
-            break;
+            connection.replace(conn);
         }
     });
 
     Ok(())
+}
+enum Connection {
+    Http(TcpStream),
+    Https(TlsStream<TcpStream>),
+}
+
+impl AsyncWrite for Connection {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        match unsafe {
+            // SAFETY: we do not move out of the pin; we only re-pin it
+            Pin::into_inner_unchecked(self)
+        } {
+            Self::Http(c) => TcpStream::poll_write(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+                buf,
+            ),
+            Self::Https(c) => TlsStream::poll_write(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+                buf,
+            ),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match unsafe {
+            // SAFETY: we do not move out of the pin; we only re-pin it
+            Pin::into_inner_unchecked(self)
+        } {
+            Self::Http(c) => TcpStream::poll_flush(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+            ),
+            Self::Https(c) => TlsStream::poll_flush(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+            ),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match unsafe {
+            // SAFETY: we do not move out of the pin; we only re-pin it
+            Pin::into_inner_unchecked(self)
+        } {
+            Self::Http(c) => TcpStream::poll_shutdown(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+            ),
+            Self::Https(c) => TlsStream::poll_shutdown(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+            ),
+        }
+    }
+}
+impl AsyncRead for Connection {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match unsafe {
+            // SAFETY: we do not move out of the pin; we only re-pin it
+            Pin::into_inner_unchecked(self)
+        } {
+            Self::Http(c) => TcpStream::poll_read(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+                buf,
+            ),
+            Self::Https(c) => TlsStream::poll_read(
+                unsafe {
+                    // SAFETY: this was previously pinned
+                    Pin::new_unchecked(c)
+                },
+                cx,
+                buf,
+            ),
+        }
+    }
 }
