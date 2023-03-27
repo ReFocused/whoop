@@ -25,22 +25,28 @@ use crate::http::modify_response;
 
 mod http;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum Error {
     Http(http::Error),
     NotFound,
     IpNotSupported,
     LoopbackIp,
-    InternalServerError,
+    InternalServerError(#[cfg(debug_assertions)] Box<dyn std::error::Error + Send + Sync>),
 }
 impl Error {
-    const fn as_str(&self) -> &'static str {
+    fn into_str(self) -> &'static str {
         match self {
             Self::Http(e) => e.as_str(),
             Self::NotFound => "Not Found",
             Self::IpNotSupported => "IP addresses are not supported",
             Self::LoopbackIp => "Don't use loopback IPs 😔",
-            Self::InternalServerError => "Internal Server Error",
+            #[cfg(not(debug_assertions))]
+            Self::InternalServerError() => "Internal Server Error",
+            #[cfg(debug_assertions)]
+            Self::InternalServerError(e) => {
+                Box::leak(format!("Internal Server Error: {e}").into_boxed_str())
+                // leaking is fine because we're running in debug mode
+            }
         }
     }
 }
@@ -49,17 +55,18 @@ impl From<http::Error> for Error {
         Self::Http(e)
     }
 }
-impl<T: std::error::Error> From<T> for Error {
-    fn from(_: T) -> Self {
-        Self::InternalServerError
+impl<T: std::error::Error + Send + Sync + 'static> From<T> for Error {
+    #[allow(unused_variables)]
+    fn from(e: T) -> Self {
+        #[cfg(debug_assertions)]
+        return Self::InternalServerError(Box::new(e));
+        #[cfg(not(debug_assertions))]
+        return Self::InternalServerError();
     }
 }
 
-async fn send_error(
-    e: impl Into<Error> + std::fmt::Debug + Send + Sync,
-    stream: &mut TcpStream,
-) {
-    let err = e.into().as_str();
+async fn send_error(e: impl Into<Error> + std::fmt::Debug + Send + Sync, stream: &mut TcpStream) {
+    let err = e.into().into_str();
     let _unneeded =
         stream
             .write_all(
@@ -120,7 +127,6 @@ async fn main() {
             if let Err(e) = handle_stream(dns_resolver, rustls_connector, &mut stream).await {
                 eprintln!("{e:#?}");
                 send_error(e, &mut stream).await;
-                return;
             }
         });
     }

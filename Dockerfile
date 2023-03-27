@@ -1,5 +1,8 @@
 FROM rust:1.68-alpine3.17 as build
 
+# FIXME: remove debug assertions after I've finished debugging
+ENV RUSTFLAGS="-C target-cpu=native -C debug_assertions" 
+
 RUN apk add --no-cache musl-dev
 
 ADD . /src
