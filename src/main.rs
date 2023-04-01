@@ -44,7 +44,7 @@ impl Error {
             Self::InternalServerError() => "Internal Server Error",
             #[cfg(debug_assertions)]
             Self::InternalServerError(e) => {
-                Box::leak(format!("Internal Server Error: {e}").into_boxed_str())
+                Box::leak(format!("Internal Server Error: {e} ({e:#?})").into_boxed_str())
                 // leaking is fine because we're running in debug mode
             }
         }
@@ -181,14 +181,34 @@ async fn handle_stream(
                 }
             };
 
+            // println!("{}", String::from_utf8_lossy(buf));
             conn.write_all(buf).await?;
             conn.flush().await?;
 
             if parser.finished {
+                let mut found_end = false;
                 stream_loop!(conn, buf, n => {
                     let buf = &mut buf[..n];
-                    modify_response(buf);
-                    stream.write_all(buf).await?;
+
+                    if found_end {
+                        stream.write_all(buf).await?;
+                        continue;
+                    }
+
+                    if modify_response(buf) {
+                        stream.write_all(buf).await?;
+                        found_end = true;
+                    } else {
+                        let Some(end_idx) = memchr::memmem::find(buf, b"\r\n\r\n") else {
+                            stream.write_all(buf).await?;
+                            continue;
+                        };
+                        found_end = true;
+                        stream.write_all(&buf[..end_idx]).await?;
+                        stream.write_all(b"Access-Control-Allow-Origin: *").await?;
+                        stream.write_all(&buf[end_idx..]).await?;
+                    }
+
                     stream.flush().await?;
                 });
                 break;

@@ -336,7 +336,6 @@ impl Parser {
                     idx + len_of_old_host,
                     len_of_new_host - len_of_old_host,
                 );
-                removed -= len_of_new_host - len_of_old_host;
             }
             Ordering::Less => {
                 remove_n_from_slice(
@@ -344,6 +343,7 @@ impl Parser {
                     idx + len_of_new_host,
                     len_of_old_host - len_of_new_host,
                 );
+                removed += len_of_old_host - len_of_new_host;
             }
             Ordering::Equal => {}
         }
@@ -387,18 +387,19 @@ impl Parser {
 }
 
 /// Modifies an HTTP response by changing the CORS header to allow all origins.
-pub fn modify_response(response: &mut [u8]) {
+pub fn modify_response(response: &mut [u8]) -> bool {
     let cors_header = b"Access-Control-Allow-Origin: ";
     let Some(start) = memchr::memmem::find(response, cors_header) else {
-        return;
+        return false;
     };
     let start = start + cors_header.len();
     let Some(end) = memchr::memchr(b'\n', &response[start..]) else {
-        return;
+        return false;
     };
     response[start] = b'*';
 
     remove_n_from_slice(response, start + 1, end - /* \r */ 1);
+    true
 }
 
 /// Removes a number of elements from a slice.
