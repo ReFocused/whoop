@@ -205,7 +205,7 @@ async fn handle_stream(
                         };
                         found_end = true;
                         stream.write_all(&buf[..end_idx]).await?;
-                        stream.write_all(b"Access-Control-Allow-Origin: *").await?;
+                        stream.write_all(b"Access-Control-Allow-Origin: *\r\n").await?;
                         stream.write_all(&buf[end_idx..]).await?;
                     }
 
