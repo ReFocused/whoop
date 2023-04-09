@@ -101,6 +101,8 @@ async fn main() {
 
     println!("Listening at http://localhost:{port}");
 
+    std::fs::create_dir_all("http").unwrap();
+
     let dns_resolver = Arc::new(
         TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()).unwrap(),
     );
@@ -137,16 +139,23 @@ async fn handle_stream(
     rustls_connector: TlsConnector,
     stream: &mut TcpStream,
 ) -> Result<(), Error> {
+    struct __ThreadId(std::num::NonZeroU64);
+    let mut in_f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(format!("http/in-{}.http", unsafe { std::mem::transmute::<_, __ThreadId>(std::thread::current().id()) }.0)).unwrap();
+    let mut origin_f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(format!("http/origin-{}.http", unsafe { std::mem::transmute::<_, __ThreadId>(std::thread::current().id()) }.0)).unwrap();
+    let mut out_f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(format!("http/out-{}.http", unsafe { std::mem::transmute::<_, __ThreadId>(std::thread::current().id()) }.0)).unwrap();
+
     let mut parser = http::Parser::default();
 
     let mut connection = None;
-
+use std::io::Write;
     stream_loop!(stream, buf, n => {
         let buf = {
+            origin_f.write_all(&buf[..n]);
             let removed = parser.modify_stream(&mut buf)?;
             let n = n - removed;
             &buf[..n]
         };
+        in_f.write_all(buf);
 
         if let Some(ref info) = parser.info {
             let ip = if info.addr.parse::<IpAddr>().is_ok() {
@@ -181,9 +190,18 @@ async fn handle_stream(
                 }
             };
 
-            // println!("{}", String::from_utf8_lossy(buf));
             conn.write_all(buf).await?;
             conn.flush().await?;
+
+            macro_rules! debg {
+                () => {
+                    debg!(buf)
+                };
+                ($buf:expr) => {{
+                    out_f.write_all($buf);
+                    $buf
+                }};
+            }
 
             if parser.finished {
                 let mut found_end = false;
@@ -191,28 +209,31 @@ async fn handle_stream(
                     let buf = &mut buf[..n];
 
                     if found_end {
+                        debg!();
                         stream.write_all(buf).await?;
                         continue;
                     }
 
                     if modify_response(buf) {
+                        debg!();
                         stream.write_all(buf).await?;
                         found_end = true;
                     } else {
                         let Some(end_idx) = memchr::memmem::find(buf, b"\r\n\r\n") else {
-                            stream.write_all(buf).await?;
+                            stream.write_all(debg!(buf)).await?;
                             continue;
                         };
                         found_end = true;
-                        stream.write_all(&buf[..end_idx]).await?;
-                        stream.write_all(b"Access-Control-Allow-Origin: *\r\n").await?;
-                        stream.write_all(&buf[end_idx..]).await?;
+                        stream.write_all(debg!(&buf[..end_idx])).await?;
+                        stream.write_all(debg!(b"\r\nAccess-Control-Allow-Origin: *\r\n")).await?;
+                        stream.write_all(debg!(&buf[end_idx..])).await?;
                     }
 
                     stream.flush().await?;
                 });
                 break;
             }
+            println!("END OUT");
 
             connection.replace(conn);
         }

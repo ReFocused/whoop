@@ -36,6 +36,9 @@ pub enum Error {
     InvalidPort,
     /// The request is invalid.
     InvalidRequest,
+    /// The HTTP version number is unsupported.
+    /// The only version numbers supported are 1.0 & 1.1
+    UnsupportedHTTPVersion,
 }
 
 impl Error {
@@ -50,6 +53,7 @@ impl Error {
             }
             Self::InvalidPort => "Invalid port",
             Self::InvalidRequest => "Invalid request",
+            Self::UnsupportedHTTPVersion => "The HTTP version number is unsupported. The only version numbers supported are 1.0 & 1.1",
         }
     }
 }
@@ -125,29 +129,10 @@ impl Parser {
             };
         }
 
-        macro_rules! peek_loop {
-            () => {
-                if let Some(byte) = peek!() {
-                    byte
-                } else {
-                    break;
-                }
-            };
-        }
-
         macro_rules! iter_loop {
-            ($var: ident => $body: block) => {
+            ($var:ident => $body:block) => {
                 loop {
                     let $var = next_loop!();
-                    $body
-                }
-            };
-        }
-
-        macro_rules! peek_iter_loop {
-            ($var: ident => $body: block) => {
-                loop {
-                    let $var = peek_loop!();
                     $body
                 }
             };
@@ -177,10 +162,30 @@ impl Parser {
         }
 
         macro_rules! remove_iter_loop {
-            ($var: ident => $body: block) => {
+            ($var:ident => $body:block) => {
                 loop {
                     let $var = remove_loop!();
                     $body
+                }
+            };
+        }
+
+        macro_rules! b_else_err {
+            ($b:literal, $e:expr) => {
+                if let Some(b) = next!().and_then(|b| if b == $b { Some(b) } else { None }) {
+                    b
+                } else {
+                    return Err($e);
+                }
+            };
+        }
+
+        macro_rules! remove_b_else_err {
+            ($b:literal, $e:expr) => {
+                if let Some(b) = remove!().and_then(|b| if b == $b { Some(b) } else { None }) {
+                    b
+                } else {
+                    return Err($e);
                 }
             };
         }
@@ -196,55 +201,30 @@ impl Parser {
             });
 
             // skip the leading `/`
-            if next!() != Some(b'/') {
-                return Err(Error::InvalidRequest);
-            }
+            b_else_err!(b'/', Error::InvalidRequest);
+
             if peek!() == Some(b'?') {
-                // give an alternate access point for weird browsers
+                // give an alternate access point because double slashes are invalid in URLs
                 remove!();
             }
 
             // get the protocol
-            let mut http = "http".bytes();
-            let mut protocol = None;
-            peek_iter_loop!(byte => {
-                let next_byte = http.next();
-                if let Some(b) = next_byte {
-                    remove!();
-                    if b != byte {
-                        break;
-                    }
-                } else {
-                    protocol.replace(if byte == b's' {
-                        remove!();
-                        Protocol::Https
-                    } else {
-                        Protocol::Http
-                    });
-                    break;
-                }
-            });
-            info.protocol = protocol.ok_or(Error::InvalidProtocol)?;
+            remove_b_else_err!(b'h', Error::InvalidProtocol);
+            remove_b_else_err!(b't', Error::InvalidProtocol);
+            remove_b_else_err!(b't', Error::InvalidProtocol);
+            remove_b_else_err!(b'p', Error::InvalidProtocol);
+
+            info.protocol = if peek!() == Some(b's') {
+                remove!();
+                Protocol::Https
+            } else {
+                Protocol::Http
+            };
 
             // skip the ://
-            let Some(byte) = remove!() else {
-                return Err(Error::InvalidProtocol);
-            };
-            if byte != b':' {
-                return Err(Error::InvalidProtocol);
-            }
-            let Some(byte) = remove!() else {
-                return Err(Error::InvalidProtocol);
-            };
-            if byte != b'/' {
-                return Err(Error::InvalidProtocol);
-            }
-            let Some(byte) = remove!() else {
-                return Err(Error::InvalidProtocol);
-            };
-            if byte != b'/' {
-                return Err(Error::InvalidProtocol);
-            }
+            remove_b_else_err!(b':', Error::InvalidProtocol);
+            remove_b_else_err!(b'/', Error::InvalidProtocol);
+            remove_b_else_err!(b'/', Error::InvalidProtocol);
 
             // get the domain and strip the domain from the buffer
             let mut addr = String::new();
@@ -277,6 +257,28 @@ impl Parser {
                 })
             });
             info.port = port;
+
+            b_else_err!(b'H', Error::InvalidRequest);
+            b_else_err!(b'T', Error::InvalidRequest);
+            b_else_err!(b'T', Error::InvalidRequest);
+            b_else_err!(b'P', Error::InvalidRequest);
+            b_else_err!(b'/', Error::InvalidRequest);
+
+            b_else_err!(b'1', Error::UnsupportedHTTPVersion);
+            b_else_err!(b'.', Error::UnsupportedHTTPVersion);
+            if next!()
+                .and_then(|b| {
+                    println!("{}", b as char);
+                    if [b'0', b'1'].contains(&b) {
+                        Some(b)
+                    } else {
+                        None
+                    }
+                })
+                .is_none()
+            {
+                return Err(Error::UnsupportedHTTPVersion);
+            };
 
             // skip the rest
             iter_loop!(byte => {
