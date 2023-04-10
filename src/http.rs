@@ -42,7 +42,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub const fn as_str(self) -> &'static str {
+    pub const fn into_str(self) -> &'static str {
         match self {
             Self::InvalidProtocol => {
                 "Invalid protocol (the path must start with http:// or https://)"
@@ -54,6 +54,13 @@ impl Error {
             Self::InvalidPort => "Invalid port",
             Self::InvalidRequest => "Invalid request",
             Self::UnsupportedHTTPVersion => "The HTTP version number is unsupported. The only version numbers supported are 1.0 & 1.1",
+        }
+    }
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::TooLong => 414,
+            Self::UnsupportedHTTPVersion => 505,
+            _ => 400,
         }
     }
 }
@@ -258,6 +265,11 @@ impl Parser {
             });
             info.port = port;
 
+            iter_loop!(byte => {
+                if byte == b' ' {
+                    break;
+                }
+            });
             b_else_err!(b'H', Error::InvalidRequest);
             b_else_err!(b'T', Error::InvalidRequest);
             b_else_err!(b'T', Error::InvalidRequest);
@@ -268,7 +280,6 @@ impl Parser {
             b_else_err!(b'.', Error::UnsupportedHTTPVersion);
             if next!()
                 .and_then(|b| {
-                    println!("{}", b as char);
                     if [b'0', b'1'].contains(&b) {
                         Some(b)
                     } else {
@@ -323,7 +334,7 @@ impl Parser {
         let len_of_old_host = memchr::memchr(b'\r', &buf[idx..]).ok_or(Error::InvalidRequest)?;
 
         let port = info.port.get();
-        let (port_bytes, port_digits) = num_to_bytes(port);
+        let (port_bytes, port_digits) = crate::num_to_bytes(port);
         let is_default_port = if info.protocol == Protocol::Http {
             port == 80
         } else {
@@ -435,29 +446,4 @@ fn shift_right(slice: &mut [u8], index: usize, n: usize) {
         #[cfg(debug_assertions)]
         panic!("index out of bounds");
     }
-}
-
-const fn num_to_bytes(mut n: u16) -> ([u8; 5], usize) {
-    let mut bytes = [0; 5];
-    let mut i = 0;
-    let mut digits = 0;
-
-    while n > 0 {
-        bytes[i] = (n % 10) as u8 + b'0';
-        n /= 10;
-        i += 1;
-        digits += 1;
-    }
-
-    // reverse the array
-    let mut j = 0;
-    #[allow(clippy::manual_swap)]
-    while j < i / 2 {
-        let tmp = bytes[j];
-        bytes[j] = bytes[i - j - 1];
-        bytes[i - j - 1] = tmp;
-        j += 1;
-    }
-
-    (bytes, digits)
 }

@@ -1,11 +1,7 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{net::Ipv4Addr, pin::Pin, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -25,28 +21,31 @@ use crate::http::modify_response;
 
 mod http;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Error {
     Http(http::Error),
     NotFound,
-    IpNotSupported,
     LoopbackIp,
-    InternalServerError(#[cfg(debug_assertions)] Box<dyn std::error::Error + Send + Sync>),
+    DowngradeToHTTP,
+    InternalServerError,
 }
 impl Error {
-    fn into_str(self) -> &'static str {
+    pub const fn into_str(self) -> &'static str {
         match self {
-            Self::Http(e) => e.as_str(),
+            Self::Http(e) => e.into_str(),
             Self::NotFound => "Not Found",
-            Self::IpNotSupported => "IP addresses are not supported",
             Self::LoopbackIp => "Don't use loopback IPs 😔",
-            #[cfg(not(debug_assertions))]
-            Self::InternalServerError() => "Internal Server Error",
-            #[cfg(debug_assertions)]
-            Self::InternalServerError(e) => {
-                Box::leak(format!("Internal Server Error: {e} ({e:#?})").into_boxed_str())
-                // leaking is fine because we're running in debug mode
-            }
+            Self::DowngradeToHTTP => "",
+            Self::InternalServerError => "Internal Server Error",
+        }
+    }
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::Http(e) => e.code(),
+            Self::NotFound => 404,
+            Self::LoopbackIp => 403,
+            Self::DowngradeToHTTP => 308,
+            Self::InternalServerError => 500,
         }
     }
 }
@@ -58,24 +57,29 @@ impl From<http::Error> for Error {
 impl<T: std::error::Error + Send + Sync + 'static> From<T> for Error {
     #[allow(unused_variables)]
     fn from(e: T) -> Self {
-        #[cfg(debug_assertions)]
-        return Self::InternalServerError(Box::new(e));
-        #[cfg(not(debug_assertions))]
-        return Self::InternalServerError();
+        Self::InternalServerError
     }
 }
 
-async fn send_error(e: impl Into<Error> + std::fmt::Debug + Send + Sync, stream: &mut TcpStream) {
-    let err = e.into().into_str();
-    let _unneeded =
-        stream
-            .write_all(
-                format!(
-                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{err}",
-                    err.len()
-                ).as_bytes(),
-            )
-            .await;
+async fn send_error(e: impl Into<Error> + Send + Sync, stream: &mut TcpStream) {
+    let e = e.into();
+    let err = e.into_str();
+    let _ = stream.write_all(b"HTTP/1.0 ").await;
+    {
+        let (bytes, digits) = num_to_bytes(e.code());
+        let _ = stream.write_all(&bytes[..digits]).await;
+    }
+    let _ = stream.write_all(b"\r\nContent-Length: ").await;
+
+    {
+        #[allow(clippy::cast_possible_truncation)] // the error length should never exceed a u16
+        let (bytes, digits) = num_to_bytes(err.len() as _);
+        let _ = stream.write_all(&bytes[..digits]).await;
+    }
+    let _ = stream
+        .write_all(b"\r\nContent-Type: text/plain\r\n\r\n")
+        .await;
+    let _ = stream.write_all(err.as_bytes()).await;
 }
 
 macro_rules! stream_loop {
@@ -139,28 +143,19 @@ async fn handle_stream(
     rustls_connector: TlsConnector,
     stream: &mut TcpStream,
 ) -> Result<(), Error> {
-    struct __ThreadId(std::num::NonZeroU64);
-    let mut in_f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(format!("http/in-{}.http", unsafe { std::mem::transmute::<_, __ThreadId>(std::thread::current().id()) }.0)).unwrap();
-    let mut origin_f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(format!("http/origin-{}.http", unsafe { std::mem::transmute::<_, __ThreadId>(std::thread::current().id()) }.0)).unwrap();
-    let mut out_f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(format!("http/out-{}.http", unsafe { std::mem::transmute::<_, __ThreadId>(std::thread::current().id()) }.0)).unwrap();
-
     let mut parser = http::Parser::default();
 
     let mut connection = None;
-use std::io::Write;
+
     stream_loop!(stream, buf, n => {
         let buf = {
-            origin_f.write_all(&buf[..n]);
             let removed = parser.modify_stream(&mut buf)?;
             let n = n - removed;
             &buf[..n]
         };
-        in_f.write_all(buf);
 
         if let Some(ref info) = parser.info {
-            let ip = if info.addr.parse::<IpAddr>().is_ok() {
-                return Err(Error::IpNotSupported);
-            } else if let Ok(ips) = dns_resolver.lookup_ip(&*info.addr).await {
+            let ip = if let Ok(ips) = dns_resolver.lookup_ip(&*info.addr).await {
                 if let Some(ip) = ips.iter().find(|ip| !ip.is_loopback()) {
                     ip
                 } else {
@@ -177,7 +172,13 @@ use std::io::Write;
             let mut conn = if let Some(c) = connection.take() {
                 c
             } else {
-                let c = TcpStream::connect((ip, info.port.get())).await?;
+                let c = match TcpStream::connect((ip, info.port.get())).await {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && info.protocol == http::Protocol::Https => {
+                        return Err(Error::DowngradeToHTTP);
+                    },
+                    Err(e) => return Err(Error::from(e)),
+                };
                 if info.protocol == http::Protocol::Https {
                     let c = rustls_connector.connect(
                         ServerName::try_from(&*info.addr).map_err(|_| Error::NotFound)?,
@@ -193,47 +194,34 @@ use std::io::Write;
             conn.write_all(buf).await?;
             conn.flush().await?;
 
-            macro_rules! debg {
-                () => {
-                    debg!(buf)
-                };
-                ($buf:expr) => {{
-                    out_f.write_all($buf);
-                    $buf
-                }};
-            }
-
             if parser.finished {
                 let mut found_end = false;
                 stream_loop!(conn, buf, n => {
                     let buf = &mut buf[..n];
 
                     if found_end {
-                        debg!();
                         stream.write_all(buf).await?;
                         continue;
                     }
 
                     if modify_response(buf) {
-                        debg!();
                         stream.write_all(buf).await?;
                         found_end = true;
                     } else {
                         let Some(end_idx) = memchr::memmem::find(buf, b"\r\n\r\n") else {
-                            stream.write_all(debg!(buf)).await?;
+                            stream.write_all(buf).await?;
                             continue;
                         };
                         found_end = true;
-                        stream.write_all(debg!(&buf[..end_idx])).await?;
-                        stream.write_all(debg!(b"\r\nAccess-Control-Allow-Origin: *\r\n")).await?;
-                        stream.write_all(debg!(&buf[end_idx..])).await?;
+                        stream.write_all(&buf[..end_idx]).await?;
+                        stream.write_all(b"\r\nAccess-Control-Allow-Origin: *\r\n").await?;
+                        stream.write_all(&buf[end_idx..]).await?;
                     }
 
                     stream.flush().await?;
                 });
                 break;
             }
-            println!("END OUT");
 
             connection.replace(conn);
         }
@@ -353,4 +341,29 @@ impl AsyncRead for Connection {
             ),
         }
     }
+}
+
+const fn num_to_bytes(mut n: u16) -> ([u8; 5], usize) {
+    let mut bytes = [0; 5];
+    let mut i = 0;
+    let mut digits = 0;
+
+    while n > 0 {
+        bytes[i] = (n % 10) as u8 + b'0';
+        n /= 10;
+        i += 1;
+        digits += 1;
+    }
+
+    // reverse the array
+    let mut j = 0;
+    #[allow(clippy::manual_swap)]
+    while j < i / 2 {
+        let tmp = bytes[j];
+        bytes[j] = bytes[i - j - 1];
+        bytes[i - j - 1] = tmp;
+        j += 1;
+    }
+
+    (bytes, digits)
 }

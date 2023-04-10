@@ -5,7 +5,7 @@
 # Learn more from ready-to-use templates: https://www.gitpod.io/docs/introduction/getting-started/quickstart
 
 tasks:
-  - init: rustup toolchain add nightly && cargo +nightly build
+  - init: rustup toolchain add nightly && rustup default nightly && rustup component add rustfmt clippy && cargo build
     command: rustup toolchain add nightly && cargo watch -x "+nightly run"
 
 
