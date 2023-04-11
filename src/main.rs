@@ -199,24 +199,25 @@ async fn handle_stream(
                 stream_loop!(conn, buf, n => {
                     let buf = &mut buf[..n];
 
-                    if found_end {
-                        stream.write_all(buf).await?;
-                        continue;
-                    }
+                    // if found_end {
+                    //     stream.write_all(buf).await?;
+                    //     continue;
+                    // }
 
-                    if modify_response(buf) {
-                        stream.write_all(buf).await?;
-                        found_end = true;
-                    } else {
-                        let Some(end_idx) = memchr::memmem::find(buf, b"\r\n\r\n") else {
-                            stream.write_all(buf).await?;
-                            continue;
-                        };
-                        found_end = true;
-                        stream.write_all(&buf[..end_idx]).await?;
-                        stream.write_all(b"\r\nAccess-Control-Allow-Origin: *\r\n").await?;
-                        stream.write_all(&buf[end_idx..]).await?;
-                    }
+                    // if modify_response(buf) {
+                    //     stream.write_all(buf).await?;
+                    //     found_end = true;
+                    // } else {
+                    //     let Some(end_idx) = memchr::memmem::find(buf, b"\r\n\r\n") else {
+                    //         stream.write_all(buf).await?;
+                    //         continue;
+                    //     };
+                    //     found_end = true;
+                    //     stream.write_all(&buf[..end_idx]).await?;
+                    //     stream.write_all(b"\r\nAccess-Control-Allow-Origin: *\r\n").await?;
+                    //     stream.write_all(&buf[end_idx..]).await?;
+                    // }
+                    stream.write_all(buf).await?;
 
                     stream.flush().await?;
                 });

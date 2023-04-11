@@ -265,6 +265,7 @@ impl Parser {
             });
             info.port = port;
 
+            // skip the path
             iter_loop!(byte => {
                 if byte == b' ' {
                     break;
