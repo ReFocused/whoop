@@ -8,26 +8,14 @@ repository = "https://github.com/TheBotlyNoob/whoop"
 keywords = ["cors", "proxy", "http", "https"]
 categories = ["network-programming", "http", "https", "proxy", "cors"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-heapless = "0.7.16"
-memchr = "2.5.0"
-tokio = { version = "1.26", features = [
-    "rt",
-    "macros",
-    "net",
-    "time",
-    "parking_lot",
-] }
-tokio-rustls = { version = "0.24.0", default-features = false, features = [
-    "tls12",
-] }
-tracing = { version = "0.1.37", features = [
-    "max_level_off",
-], default-features = false }
-trust-dns-resolver = "0.22.0"
-webpki-roots = "0.23.0"
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+shuttle-runtime = "0.27.0"
+shuttle-tower = "0.27.0"
+tower = { version = "0.4.13", features = ["full"] }
+hyper-tls = "0.5.0"
+
 
 [profile.release]
 opt-level = 3
